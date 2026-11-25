@@ -1,0 +1,1349 @@
+diff --git a/functions.php b/functions.php
+index 80ac7ddb8..560a4d38f 100644
+--- a/functions.php
++++ b/functions.php
+@@ -127,7 +127,10 @@ require_once __DIR__ . '/functions/weekly_summary.php';
+ require_once __DIR__ . '/functions/sms.php';
+ require_once __DIR__ . '/functions/rmm.php';
+ require_once __DIR__ . '/functions/rmm_tactical.php';
++require_once __DIR__ . '/functions/rmm_action1.php';
++require_once __DIR__ . '/functions/rmm_msp360.php';
+ require_once __DIR__ . '/functions/rmm_unifi.php';
++require_once __DIR__ . '/functions/rmm_omada.php';
+ require_once __DIR__ . '/functions/rmm_network.php';
+ require_once __DIR__ . '/functions/phone.php';
+ require_once __DIR__ . '/functions/client_onboarding.php';
+diff --git a/functions/rmm.php b/functions/rmm.php
+index dcc27c908..2f0ad2567 100644
+--- a/functions/rmm.php
++++ b/functions/rmm.php
+@@ -81,10 +81,13 @@ function rmmProviderKinds(?string $family = null): array
+ {
+     $kinds = [
+         'tactical' => rmmTacticalKind(),
++        'action1' => rmmAction1Kind(),
++        'msp360' => rmmMsp360Kind(),
+     ];
+     // Network platforms keep columns of their own - once the 4.1.5 database update is in
+     if (rmmNetworkReady()) {
+         $kinds += rmmUnifiKinds();
++        $kinds += rmmOmadaKinds();
+     }
+     if ($family === null) {
+         return $kinds;
+diff --git a/functions/rmm_action1.php b/functions/rmm_action1.php
+new file mode 100644
+index 000000000..3746e786c
+--- /dev/null
++++ b/functions/rmm_action1.php
+@@ -0,0 +1,351 @@
++<?php
++
++/*
++ * Action1 - an RMM Providers kind (functions/rmm.php).
++ *
++ * Its API is at /api/3.0 on the address of its console for the account's region
++ * (app.action1.com, app.eu.action1.com and so on). It signs in with API credentials made in
++ * Action1 under Configuration > Users & API Credentials: a client ID and secret, posted as a
++ * form to /oauth2/token for a token sent as Authorization: Bearer. The credentials act with the
++ * role and the organizations they were given, so those decide what ITFlow can see.
++ *
++ * /organizations lists its organizations - a provider's clients here - and
++ * /endpoints/managed/<organization> an organization's endpoints. Lists come a page at a time
++ * ({items, total_items, next_page}), and it answers 429 when asked too often, saying how long
++ * to wait.
++ *
++ * It has no alerts to read, so alerts opening tickets isn't offered for it.
++ */
++
++/** What Action1 is, as rmmProviderKinds() describes a kind. */
++function rmmAction1Kind(): array
++{
++    return [
++        'name' => 'Action1',
++        'short' => 'Action1',
++        'icon' => 'fas fa-laptop-medical',
++        'about' => 'Its endpoints become assets on the clients you link to its organizations, with whether each is connected, who is signed in and whether updates or a reboot are waiting.',
++        'docs_url' => 'https://www.action1.com/api-documentation/',
++        'seal' => true,
++        'fields' => [
++            'api_url' => [
++                'label' => 'Console address', 'icon' => 'fa-server', 'type' => 'url', 'required' => true, 'placeholder' => 'https://app.action1.com',
++                'help' => 'The address your Action1 console opens at - it differs by region, like https://app.eu.action1.com.',
++                'needed' => 'Action1\'s console address is needed - as it is in your browser, like https://app.action1.com.',
++            ],
++            'api_key' => [
++                'label' => 'Client ID', 'icon' => 'fa-id-badge', 'type' => 'text', 'required' => true, 'placeholder' => '',
++                'help' => 'In Action1: Configuration > Users & API Credentials > New API Credentials. Give them a role that can only view, and the organizations ITFlow should see.',
++                'needed' => 'The client ID is needed - make API credentials in Action1 under Configuration > Users & API Credentials.',
++            ],
++            'api_secret' => [
++                'label' => 'Client secret', 'icon' => 'fa-key', 'type' => 'secret', 'required' => true, 'placeholder' => '',
++                'help' => 'Shown once, when the credentials are made. Kept encrypted with this ITFlow\'s own key.',
++                'needed' => 'The client secret is needed - Action1 shows it once, when the credentials are made.',
++            ],
++        ],
++        'attention' => ['patches_pending' => 'Updates missing'],
++        'hints' => [
++            'auth' => 'check the client ID and secret, and that their role can see organizations and endpoints.',
++            'not_found' => 'is that your Action1 console\'s address, for your region?',
++            'not_json' => 'is that your Action1 console\'s address, for your region?',
++        ],
++        'links' => [],
++        'clients' => 'rmmAction1Clients',
++        'devices' => 'rmmAction1Devices',
++        'dashboard' => 'rmmAction1Dashboard',
++    ];
++}
++
++/*
++ * ------------------------------------------------------------------ Asking Action1
++ */
++
++/** The console's address - the one set, without the API's path when that was pasted with it. '' when it isn't set. */
++function rmmAction1Console(array $provider): string
++{
++    $base = rmmUrlClean($provider['rmm_provider_api_url'] ?? '');
++    return $base === '' ? '' : (string) preg_replace('#/(api(/3\.0)?|console(/.*)?)$#i', '', $base);
++}
++
++/**
++ * Signed in - ['ok', 'token', 'error']. The client ID and secret go as a form, which
++ * rmmHttp() doesn't send, so this asks for itself, with the same care: no redirects, http and
++ * https only. The token is kept for the request; $again gets a new one.
++ */
++function rmmAction1Token(array $provider, bool $again = false): array
++{
++    static $tokens = [];
++    $id = intval($provider['rmm_provider_id'] ?? 0);
++    if (!$again && isset($tokens[$id])) {
++        return $tokens[$id];
++    }
++    $name = rmmProviderName($provider);
++    $console = rmmAction1Console($provider);
++    $client_id = trim((string) ($provider['rmm_provider_api_key'] ?? ''));
++    $secret = rmmSecret($provider, 'api_secret');
++    if ($console === '' || $client_id === '' || $secret === '') {
++        $unread = $secret === '' && (string) ($provider['rmm_provider_api_secret'] ?? '') !== '' ? ' - its secret can\'t be read, so type it again' : '';
++        return ['ok' => false, 'token' => '', 'error' => "Its address, client ID and secret aren't set$unread."];
++    }
++    $host = (string) parse_url($console, PHP_URL_HOST);
++    $ch = curl_init("$console/api/3.0/oauth2/token");
++    curl_setopt_array($ch, [
++        CURLOPT_RETURNTRANSFER => true,
++        CURLOPT_POST => true,
++        CURLOPT_POSTFIELDS => http_build_query(['client_id' => $client_id, 'client_secret' => $secret], '', '&'),
++        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Content-Type: application/x-www-form-urlencoded'],
++        CURLOPT_TIMEOUT => 30,
++        CURLOPT_CONNECTTIMEOUT => 10,
++        CURLOPT_USERAGENT => 'ITFlow',
++        CURLOPT_FOLLOWLOCATION => false,
++        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
++    ]);
++    $raw = curl_exec($ch);
++    $transport = curl_error($ch);
++    $code = intval(curl_getinfo($ch, CURLINFO_HTTP_CODE));
++    curl_close($ch);
++    if ($raw === false) {
++        return $tokens[$id] = ['ok' => false, 'token' => '', 'error' => "Couldn't reach $host - $transport"];
++    }
++    $json = json_decode((string) $raw, true);
++    $token = is_array($json) ? (string) ($json['access_token'] ?? '') : '';
++    if (in_array($code, [400, 401, 403], true)) {
++        return $tokens[$id] = ['ok' => false, 'token' => '', 'error' => "$name turned the client ID and secret away (HTTP $code) - check them, and that the console address is the one for your region."];
++    }
++    if ($code < 200 || $code > 299 || $token === '' || preg_match('/[\x00-\x20]/', $token)) {
++        return $tokens[$id] = ['ok' => false, 'token' => '', 'error' => "$host answered the sign-in (HTTP $code), but didn't sign ITFlow in - is that your Action1 console's address?"];
++    }
++    return $tokens[$id] = ['ok' => true, 'token' => $token, 'error' => ''];
++}
++
++/**
++ * Ask Action1's API - GET /api/3.0<path>: rmmHttp()'s answer. A token that was turned away is
++ * got again, once; asked too often (429), it waits as long as Action1 says - a quarter of a
++ * minute at most, twice at most - and asks again.
++ */
++function rmmAction1Request(array $provider, string $path, array $query = [], int $timeout = 60): array
++{
++    $url = rmmAction1Console($provider) . '/api/3.0/' . ltrim($path, '/') . ($query ? '?' . http_build_query($query, '', '&') : '');
++    $signed = rmmAction1Token($provider);
++    $again = false;
++    $waits = 0;
++    while (true) {
++        if (!$signed['ok']) {
++            return ['ok' => false, 'code' => 0, 'json' => null, 'error' => $signed['error'], 'headers' => []];
++        }
++        $answer = rmmHttp($provider, 'GET', $url, ['Authorization: Bearer ' . $signed['token']], null, $timeout);
++        if ($answer['code'] === 401 && !$again) {
++            $again = true;
++            $signed = rmmAction1Token($provider, true);
++            continue;
++        }
++        if ($answer['code'] === 429 && $waits < 2) {
++            $waits++;
++            $wait = intval(is_array($answer['json']) ? ($answer['json']['retry_after'] ?? 0) : 0) ?: intval($answer['headers']['retry-after'] ?? 0);
++            sleep(max(1, min(15, $wait ?: 5)));
++            continue;
++        }
++        return $answer;
++    }
++}
++
++/**
++ * Ask Action1 for a list, page by page - ['ok', 'items', 'total', 'error']. A page that isn't a
++ * list is an error, never "it has none": read as none, every endpoint would be marked gone.
++ * $first is the first page when it was asked for already (rmmAction1FirstPage()).
++ */
++function rmmAction1List(array $provider, string $path, array $query = [], ?array $first = null): array
++{
++    $items = [];
++    $next_path = $path;
++    $next_query = $query + ['limit' => 50];
++    for ($page = 0; $page < 200; $page++) {
++        $answer = $page === 0 && $first !== null ? $first : rmmAction1Request($provider, $next_path, $next_query);
++        if (!$answer['ok']) {
++            return ['ok' => false, 'items' => [], 'total' => 0, 'error' => $answer['error']];
++        }
++        $rows = $answer['json']['items'] ?? null;
++        if (!rmmIsList($rows)) {
++            return ['ok' => false, 'items' => [], 'total' => 0, 'error' => rmmProviderName($provider) . ' answered, but not with a list - nothing was changed'];
++        }
++        $items = array_merge($items, $rows);
++        $total = intval($answer['json']['total_items'] ?? count($items));
++        if (!$rows || count($items) >= $total) {
++            return ['ok' => true, 'items' => $items, 'total' => max($total, count($items)), 'error' => ''];
++        }
++        // The page after this one: where Action1 says it is, or failing that the next from where this one ended
++        $next = rmmAction1NextPage($answer['json']['next_page'] ?? '');
++        [$next_path, $next_query] = $next ?? [$path, $query + ['from' => count($items), 'limit' => 50]];
++    }
++    return ['ok' => false, 'items' => [], 'total' => 0, 'error' => rmmProviderName($provider) . ' has more than ITFlow reads in one go - nothing was changed'];
++}
++
++/**
++ * Action1's next_page as a path and query to ask for - [path, query], or null when it gives
++ * none ITFlow can use. It comes as an address or a path; only its path under /api/3.0 and its
++ * query are taken, and asked of the console's own address - the token is never sent to an
++ * address an answer named.
++ */
++function rmmAction1NextPage($next): ?array
++{
++    $next = is_string($next) ? trim($next) : '';
++    if ($next === '') {
++        return null;
++    }
++    $path = '/' . ltrim((string) parse_url($next, PHP_URL_PATH), '/');
++    $path = ltrim((string) preg_replace('#^/api/3\.0/#i', '/', $path), '/');
++    if ($path === '' || str_contains($path, '..') || !preg_match('#^[A-Za-z0-9_./%-]+$#', $path)) {
++        return null;
++    }
++    parse_str((string) parse_url($next, PHP_URL_QUERY), $query);
++    $query = array_filter($query, 'is_scalar');
++    return isset($query['from']) || isset($query['limit']) ? [$path, $query] : null;
++}
++
++/**
++ * The first page of an organization's endpoints, kept for the request - asked for once to count
++ * them for the clients list, and read again when the sync brings them in, so an organization
++ * costs one request and not two. $again asks afresh.
++ */
++function rmmAction1FirstPage(array $provider, string $organization, bool $again = false): array
++{
++    static $pages = [];
++    $key = intval($provider['rmm_provider_id'] ?? 0) . '|' . $organization;
++    // Kept two minutes at most - long enough for one sync, never long enough to bring in what has since changed
++    if ($again || !isset($pages[$key]) || $pages[$key][0] < time() - 120) {
++        $pages[$key] = [time(), rmmAction1Request($provider, 'endpoints/managed/' . rawurlencode($organization), ['fields' => '*', 'limit' => 50])];
++    }
++    return $pages[$key][1];
++}
++
++/*
++ * ------------------------------------------------------------------ Organizations and endpoints
++ */
++
++/** Action1's organizations - ['ok', 'clients' => [id, name, sites, devices], 'error']. */
++function rmmAction1Clients(array $provider): array
++{
++    $answer = rmmAction1List($provider, 'organizations');
++    if (!$answer['ok']) {
++        return ['ok' => false, 'clients' => [], 'error' => $answer['error']];
++    }
++    $clients = [];
++    foreach ($answer['items'] as $organization) {
++        $id = is_array($organization) ? (string) ($organization['id'] ?? '') : '';
++        if (!preg_match('/^[A-Za-z0-9_-]{1,100}$/', $id)) {
++            continue;
++        }
++        $name = rmmText($organization['name'] ?? '', 200);
++        $page = rmmAction1FirstPage($provider, $id);
++        $clients[] = [
++            'id' => $id,
++            'name' => $name !== '' ? $name : "Organization $id",
++            'sites' => 0,
++            'devices' => $page['ok'] && is_array($page['json']) ? intval($page['json']['total_items'] ?? count((array) ($page['json']['items'] ?? []))) : 0,
++        ];
++    }
++    return ['ok' => true, 'clients' => $clients, 'error' => ''];
++}
++
++/** An Action1 organization's endpoints - ['ok', 'devices', 'error'], each device as rmmDeviceSave() takes it. */
++function rmmAction1Devices(array $provider, string $client_remote_id): array
++{
++    if (!preg_match('/^[A-Za-z0-9_-]{1,100}$/', $client_remote_id)) {
++        return ['ok' => false, 'devices' => [], 'error' => 'That isn\'t one of ' . rmmProviderName($provider) . '\'s organizations'];
++    }
++    $first = rmmAction1FirstPage($provider, $client_remote_id);
++    if (!$first['ok']) {
++        // One that failed when it was counted is asked for again, not taken as it was
++        $first = rmmAction1FirstPage($provider, $client_remote_id, true);
++    }
++    $answer = rmmAction1List($provider, 'endpoints/managed/' . rawurlencode($client_remote_id), ['fields' => '*'], $first);
++    if (!$answer['ok']) {
++        return ['ok' => false, 'devices' => [], 'error' => $answer['error']];
++    }
++    $devices = [];
++    foreach ($answer['items'] as $endpoint) {
++        // One being uninstalled is on its way out - not brought in
++        if (is_array($endpoint) && isset($endpoint['id']) && stripos((string) ($endpoint['status'] ?? ''), 'uninstall') === false) {
++            $devices[] = rmmAction1Device($endpoint);
++        }
++    }
++    return ['ok' => true, 'devices' => $devices, 'error' => ''];
++}
++
++/** One of Action1's endpoints as a device. */
++function rmmAction1Device(array $endpoint): array
++{
++    $text = function ($key, $max = 255) use ($endpoint) {
++        $value = rmmText($endpoint[$key] ?? '', $max);
++        return rmmIsPlaceholder($value) || strcasecmp($value, 'UNDEFINED') === 0 ? '' : $value;
++    };
++    $os = $text('OS', 200);
++    $platform = strtolower($text('platform', 50));
++    $family = str_contains($platform, 'win') || stripos($os, 'windows') === 0 ? 'windows'
++        : (str_contains($platform, 'mac') || stripos($os, 'mac') === 0 ? 'darwin' : (str_contains($platform, 'linux') ? 'linux' : ''));
++    $state = strtolower($text('status', 50));
++    $address = $text('address', 500);
++    $mac = '';
++    foreach (preg_split('/[\s,;]+/', (string) (is_scalar($endpoint['MAC'] ?? null) ? $endpoint['MAC'] : '')) as $one) {
++        if (rmmMac($one) !== '') {
++            $mac = rmmMac($one);
++            break;
++        }
++    }
++    $cpu = trim(str_replace(['(R)', '(TM)', '(tm)', '(r)'], '', $text('CPU_name', 300)));
++    $cores = $text('CPU_size', 100);
++    $name = $text('name', 200);
++    return [
++        'remote_id' => (string) ($endpoint['id'] ?? ''),
++        'mac' => $mac,
++        'hostname' => $name !== '' ? $name : $text('device_name', 200),
++        'site' => '',
++        // Action1 doesn't say which it watches as a server - Windows Server does, and Linux is taken as one
++        'role' => stripos($os, 'server') !== false || $family === 'linux' ? 'server' : 'workstation',
++        'platform' => $family,
++        'os' => $os,
++        'status' => $state === 'connected' ? 'online' : ($state === 'disconnected' ? 'offline' : ''),
++        'last_seen_at' => rmmAction1Time($endpoint['last_seen'] ?? null),
++        'boot_at' => rmmAction1Time($endpoint['last_boot_time'] ?? null),
++        'logged_user' => $text('user'),
++        'public_ip' => $text('external_address', 100),
++        'local_ips' => $address,
++        'needs_reboot' => strcasecmp($text('reboot_required', 20), 'yes') === 0,
++        'patches_pending' => intval($endpoint['missing_critical_updates'] ?? 0) + intval($endpoint['missing_other_updates'] ?? 0) > 0,
++        'agent_version' => $text('agent_version', 50),
++        'asset' => [
++            'make' => $text('manufacturer', 200),
++            'model' => $text('model', 200),
++            'serial' => (string) (is_scalar($endpoint['serial'] ?? null) ? $endpoint['serial'] : ''),
++            'os' => $os,
++            'ip' => $address,
++            'cpu' => mb_substr(trim($cpu . ($cpu !== '' && $cores !== '' ? ', ' : '') . $cores), 0, 255),
++            'storage' => $text('disk', 255),
++            'mac' => $mac,
++        ],
++    ];
++}
++
++/**
++ * Action1's times - "2023-12-09_01-44-11", taken as UTC - as one in ITFlow's timezone. Anything
++ * else is left to rmmTime(); null when there isn't one.
++ */
++function rmmAction1Time($value): ?string
++{
++    $value = is_scalar($value) ? trim((string) $value) : '';
++    if ($value === '' || strcasecmp($value, 'UNDEFINED') === 0) {
++        return null;
++    }
++    if (preg_match('/^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})$/', $value, $parts)) {
++        return rmmTime("$parts[1]T$parts[2]:$parts[3]:$parts[4]Z");
++    }
++    return rmmTime($value);
++}
++
++/** Where Open in Action1 goes - its console. */
++function rmmAction1Dashboard(array $provider): string
++{
++    $console = rmmAction1Console($provider);
++    return $console === '' ? '' : "$console/console/dashboard";
++}
+diff --git a/functions/rmm_msp360.php b/functions/rmm_msp360.php
+new file mode 100644
+index 000000000..7a4d0f0cf
+--- /dev/null
++++ b/functions/rmm_msp360.php
+@@ -0,0 +1,484 @@
++<?php
++
++/*
++ * MSP360 RMM - an RMM Providers kind (functions/rmm.php).
++ *
++ * MSP360 has two APIs, and this reads both, because neither has everything:
++ *
++ *   The Managed Backup API (api.mspbackups.com) knows the companies - a provider's clients
++ *   here - and which company each computer belongs to, whether it is online and which agents
++ *   it has. It signs in with the API login and password made in MSP360 under Settings >
++ *   General > API (POST /api/Provider/Login, then Authorization: Bearer). /api/Companies lists
++ *   the companies, /api/Computers/<offset>/<count> the computers.
++ *
++ *   The RMM API (api.rmm.mspbackups.com) knows what each computer is - maker, model, serial
++ *   number, OS, addresses, CPU - and whether a reboot or updates are waiting, but not whose it
++ *   is. It takes an RMM API token made under Settings > General > RMM API tokens, sent as
++ *   Authorization: Bearer. /api/v1/computers/stat/host/latest and .../stat/summary/latest give
++ *   every computer a page at a time ({items, total, pageNumber, pageSize}). It is read-only.
++ *
++ * A computer is the same one in both by its HID, which is its id here. Only computers with the
++ * RMM agent are brought in. Without an RMM API token they still come in, with no hardware
++ * details. The login is kept where another kind keeps its dashboard address
++ * (rmm_provider_web_url), as text; the password and the token are both kept sealed.
++ *
++ * MSP360 doesn't publish what /api/Computers answers, so its fields are read by the names its
++ * console uses, in either capitalisation, and a list is found whether or not it is wrapped.
++ * MSP360 asks that RMM data isn't asked for more than hourly, and alerts not more than every
++ * ten minutes; the sync's fifteen minutes is within the first.
++ *
++ * Not here yet: alerts opening tickets (the summary has them, with ids), and storage.
++ */
++
++// Where MSP360's APIs and console are
++defined('RMM_MSP360_BACKUP_API') || define('RMM_MSP360_BACKUP_API', 'https://api.mspbackups.com');
++defined('RMM_MSP360_RMM_API') || define('RMM_MSP360_RMM_API', 'https://api.rmm.mspbackups.com');
++defined('RMM_MSP360_CONSOLE') || define('RMM_MSP360_CONSOLE', 'https://console.msp360.com');
++
++/** What MSP360 RMM is, as rmmProviderKinds() describes a kind. */
++function rmmMsp360Kind(): array
++{
++    return [
++        'name' => 'MSP360 RMM',
++        'short' => 'MSP360',
++        'icon' => 'fas fa-laptop-medical',
++        'about' => 'Its computers with the RMM agent become assets on the clients you link to its companies, with whether each is online, who is signed in and whether updates or a reboot are waiting.',
++        'docs_url' => 'https://help.mspbackups.com/mbs-api-specification',
++        'seal' => true,
++        'fields' => [
++            'web_url' => [
++                'label' => 'API login', 'icon' => 'fa-user', 'type' => 'text', 'required' => true, 'placeholder' => '',
++                'help' => 'In MSP360: Settings > General > API > Add Credentials. The login it makes - not the one you sign in to the console with.',
++                'needed' => 'The API login is needed - make API credentials in MSP360 under Settings > General > API.',
++            ],
++            'api_key' => [
++                'label' => 'API password', 'icon' => 'fa-lock', 'type' => 'secret', 'required' => true, 'placeholder' => '', 'spaces' => true,
++                'help' => 'Made with the API login. Kept encrypted with this ITFlow\'s own key.',
++                'needed' => 'The API password is needed - it is made with the API login in MSP360.',
++            ],
++            'api_secret' => [
++                'label' => 'RMM API token', 'icon' => 'fa-key', 'type' => 'secret', 'required' => false, 'placeholder' => '',
++                'help' => 'In MSP360: Settings > General > RMM API tokens. It brings in each computer\'s maker, model, serial number and OS; left empty, computers come in without them. Kept encrypted with this ITFlow\'s own key.',
++                'needed' => '',
++            ],
++        ],
++        'attention' => ['patches_pending' => 'Updates available'],
++        'hints' => [
++            'auth' => 'check the API login and password, and the RMM API token - each is made in MSP360 under Settings > General.',
++            'not_found' => '',
++            'not_json' => '',
++        ],
++        'links' => [],
++        'clients' => 'rmmMsp360Clients',
++        'devices' => 'rmmMsp360Devices',
++        'dashboard' => 'rmmMsp360Dashboard',
++    ];
++}
++
++/*
++ * ------------------------------------------------------------------ Asking MSP360
++ */
++
++/** A value from one of MSP360's records by its name, however it is capitalised - null when it hasn't it. */
++function rmmMsp360Value($row, string ...$names)
++{
++    if (!is_array($row)) {
++        return null;
++    }
++    foreach ($names as $name) {
++        foreach ([$name, ucfirst($name), lcfirst($name)] as $key) {
++            if (array_key_exists($key, $row)) {
++                return $row[$key];
++            }
++        }
++    }
++    return null;
++}
++
++/** The list in an answer - the answer itself, or the first list it wraps under one of $names. null when there isn't one. */
++function rmmMsp360Rows($json, string ...$names): ?array
++{
++    if (rmmIsList($json)) {
++        return $json;
++    }
++    $rows = rmmMsp360Value($json, ...$names);
++    return rmmIsList($rows) ? $rows : null;
++}
++
++/**
++ * Signed in to the Managed Backup API - ['ok', 'token', 'error']. Kept for the request; $again
++ * signs in afresh, for a token that was turned away.
++ */
++function rmmMsp360Login(array $provider, bool $again = false): array
++{
++    static $tokens = [];
++    $id = intval($provider['rmm_provider_id'] ?? 0);
++    if (!$again && isset($tokens[$id])) {
++        return $tokens[$id];
++    }
++    $name = rmmProviderName($provider);
++    $login = trim((string) ($provider['rmm_provider_web_url'] ?? ''));
++    $password = rmmSecret($provider, 'api_key');
++    if ($login === '' || $password === '') {
++        $unread = $password === '' && (string) ($provider['rmm_provider_api_key'] ?? '') !== '' ? ' - its password can\'t be read, so type it again' : '';
++        return ['ok' => false, 'token' => '', 'error' => "Its API login and password aren't set$unread."];
++    }
++    $answer = rmmHttp($provider, 'POST', rtrim(RMM_MSP360_BACKUP_API, '/') . '/api/Provider/Login', [], ['UserName' => $login, 'Password' => $password]);
++    if (in_array($answer['code'], [400, 401, 403], true)) {
++        return $tokens[$id] = ['ok' => false, 'token' => '', 'error' => "$name turned the API login and password away (HTTP {$answer['code']}) - check them: the ones made in MSP360 under Settings > General > API."];
++    }
++    if (!$answer['ok']) {
++        return $tokens[$id] = ['ok' => false, 'token' => '', 'error' => $answer['error']];
++    }
++    $token = (string) (rmmMsp360Value($answer['json'], 'access_token', 'accessToken', 'token') ?? '');
++    if ($token === '' || preg_match('/[\x00-\x20]/', $token)) {
++        return $tokens[$id] = ['ok' => false, 'token' => '', 'error' => "$name answered the sign-in, but didn't sign ITFlow in."];
++    }
++    return $tokens[$id] = ['ok' => true, 'token' => $token, 'error' => ''];
++}
++
++/** Ask the Managed Backup API - GET <path>: rmmHttp()'s answer. A token that was turned away is got again, once. */
++function rmmMsp360Backup(array $provider, string $path, int $timeout = 60): array
++{
++    $signed = rmmMsp360Login($provider);
++    for ($try = 0; $try < 2; $try++) {
++        if (!$signed['ok']) {
++            return ['ok' => false, 'code' => 0, 'json' => null, 'error' => $signed['error'], 'headers' => []];
++        }
++        $answer = rmmHttp($provider, 'GET', rtrim(RMM_MSP360_BACKUP_API, '/') . '/' . ltrim($path, '/'), ['Authorization: Bearer ' . $signed['token']], null, $timeout);
++        if ($answer['code'] === 401 && $try === 0) {
++            $signed = rmmMsp360Login($provider, true);
++            continue;
++        }
++        break;
++    }
++    return $answer;
++}
++
++/**
++ * Every computer the Managed Backup API lists, kept for the request (two minutes at most) -
++ * ['ok', 'computers' => [hid => computer], 'agents_said', 'error']. Each computer: hid, name,
++ * company_id, company_name, online (true, false or null), os, ip, user, seen, version and rmm -
++ * whether it has the RMM agent, null when the answer doesn't say which agents it has. Hidden
++ * ones, and ones not authorized yet, are left out.
++ */
++function rmmMsp360Computers(array $provider): array
++{
++    static $kept = [];
++    $id = intval($provider['rmm_provider_id'] ?? 0);
++    if (isset($kept[$id]) && $kept[$id][0] >= time() - 120) {
++        return $kept[$id][1];
++    }
++    $name = rmmProviderName($provider);
++    $computers = [];
++    $agents_said = false;
++    $count = 100;
++    $read = 0;
++    for ($page = 0; $page < 500; $page++) {
++        $answer = rmmMsp360Backup($provider, "api/Computers/$read/$count");
++        if (!$answer['ok']) {
++            return ['ok' => false, 'computers' => [], 'agents_said' => false, 'error' => $answer['error']];
++        }
++        $rows = rmmMsp360Rows($answer['json'], 'computers', 'items', 'data', 'result');
++        if ($rows === null) {
++            return ['ok' => false, 'computers' => [], 'agents_said' => false, 'error' => "$name answered, but not with a list of computers - nothing was changed"];
++        }
++        $total = rmmMsp360Value($answer['json'], 'total', 'totalCount', 'count');
++        foreach ($rows as $row) {
++            $hid = (string) (rmmMsp360Value($row, 'hid') ?? '');
++            $status = strtolower((string) (rmmMsp360Value($row, 'authStatus') ?? ''));
++            if (!preg_match('/^[A-Za-z0-9_.:-]{1,100}$/', $hid) || !empty(rmmMsp360Value($row, 'hidden')) || !in_array($status, ['', 'authorized'], true)) {
++                continue;
++            }
++            $company = rmmMsp360Value($row, 'company');
++            $apps = rmmMsp360Value($row, 'apps', 'applications');
++            $rmm = null;
++            $rmm_app = null;
++            if (rmmIsList($apps)) {
++                $agents_said = true;
++                $rmm = false;
++                foreach ($apps as $app) {
++                    if (strtolower((string) (rmmMsp360Value($app, 'applicationId', 'appId') ?? '')) === 'rmm') {
++                        $rmm = true;
++                        $rmm_app = $app;
++                    }
++                }
++            }
++            // Whether it is online is the RMM agent's word when it has one, the computer's otherwise
++            $online = rmmMsp360Value($rmm_app, 'online') ?? rmmMsp360Value($row, 'online');
++            $computers[$hid] = [
++                'hid' => $hid,
++                'name' => rmmText(rmmMsp360Value($row, 'name', 'computerName', 'displayName') ?? '', 200),
++                'company_id' => (string) (rmmMsp360Value($company, 'id') ?? rmmMsp360Value($row, 'companyId') ?? ''),
++                'company_name' => rmmText(rmmMsp360Value($company, 'name') ?? rmmMsp360Value($row, 'companyName') ?? '', 200),
++                'online' => is_bool($online) ? $online : null,
++                'os' => strtolower((string) (rmmMsp360Value($row, 'os') ?? '')),
++                'ip' => rmmText(rmmMsp360Value($row, 'ipAddress', 'ip') ?? '', 100),
++                'user' => rmmText(rmmMsp360Value($row, 'lastLoggedUser') ?? '', 255),
++                'seen' => rmmMsp360Value($row, 'lastActivity'),
++                'version' => rmmText(rmmMsp360Value($rmm_app, 'version') ?? '', 50),
++                'rmm' => $rmm,
++            ];
++        }
++        $read += count($rows);
++        // All of them read - by its count when it gives one, or by a page that came back short
++        if (!$rows || (is_numeric($total) ? $read >= intval($total) : count($rows) < $count)) {
++            $result = ['ok' => true, 'computers' => $computers, 'agents_said' => $agents_said, 'error' => ''];
++            $kept[$id] = [time(), $result];
++            return $result;
++        }
++    }
++    return ['ok' => false, 'computers' => [], 'agents_said' => false, 'error' => "$name has more computers than ITFlow reads in one go - nothing was changed"];
++}
++
++/**
++ * One kind of the RMM API's statistics for every computer (host or summary), kept for the
++ * request (two minutes at most) - ['ok', 'by_hid', 'by_name', 'asked', 'error']: asked is
++ * false when no RMM API token is set. by_name has the ones only one computer has the name of,
++ * for an answer that doesn't say each computer's HID.
++ *
++ * Pages are asked for from 0: an API that counts from 1 gives its first page twice or refuses
++ * 0, and one read twice is kept once.
++ */
++function rmmMsp360Stats(array $provider, string $type): array
++{
++    static $kept = [];
++    $key = intval($provider['rmm_provider_id'] ?? 0) . '|' . $type;
++    if (isset($kept[$key]) && $kept[$key][0] >= time() - 120) {
++        return $kept[$key][1];
++    }
++    $token = rmmSecret($provider, 'api_secret');
++    if ($token === '') {
++        $unread = (string) ($provider['rmm_provider_api_secret'] ?? '') !== '';
++        return ['ok' => !$unread, 'by_hid' => [], 'by_name' => [], 'asked' => false, 'error' => $unread ? 'Its RMM API token can\'t be read, so type it again.' : ''];
++    }
++    $name = rmmProviderName($provider);
++    $url = rtrim(RMM_MSP360_RMM_API, '/') . "/api/v1/computers/stat/$type/latest";
++    $seen = [];
++    $items = [];
++    $idle = 0;
++    for ($page = 0; $page < 200; $page++) {
++        $answer = rmmHttp($provider, 'GET', "$url?" . http_build_query(['pageNumber' => $page, 'pageSize' => 100], '', '&'), ['Authorization: Bearer ' . $token], null, 60);
++        if (!$answer['ok'] && $page === 0 && in_array($answer['code'], [400, 404, 422], true)) {
++            continue;
++        }
++        if (!$answer['ok']) {
++            return ['ok' => false, 'by_hid' => [], 'by_name' => [], 'asked' => true, 'error' => $answer['error']];
++        }
++        $rows = rmmMsp360Rows($answer['json'], 'items', 'data', 'result');
++        if ($rows === null) {
++            return ['ok' => false, 'by_hid' => [], 'by_name' => [], 'asked' => true, 'error' => "$name's RMM API answered, but not with a list - nothing was changed"];
++        }
++        $new = 0;
++        foreach ($rows as $row) {
++            $mark = is_array($row) ? md5(json_encode($row)) : '';
++            if ($mark !== '' && !isset($seen[$mark])) {
++                $seen[$mark] = true;
++                $items[] = $row;
++                $new++;
++            }
++        }
++        $idle = $new ? 0 : $idle + 1;
++        $total = rmmMsp360Value($answer['json'], 'total', 'totalCount');
++        if ((is_numeric($total) && count($items) >= intval($total)) || ($page >= 1 && !$rows) || $idle >= 2) {
++            break;
++        }
++    }
++    $by_hid = [];
++    $names = [];
++    foreach ($items as $row) {
++        $hid = (string) (rmmMsp360Value($row, 'hid') ?? '');
++        if ($hid !== '') {
++            $by_hid[strtolower($hid)] = $row;
++        }
++        $computer = mb_strtolower(rmmText(rmmMsp360Value($row, 'computerName') ?? '', 200));
++        if ($computer !== '') {
++            $names[$computer][] = $row;
++        }
++    }
++    $by_name = [];
++    foreach ($names as $computer => $rows) {
++        if (count($rows) === 1) {
++            $by_name[$computer] = $rows[0];
++        }
++    }
++    $result = ['ok' => true, 'by_hid' => $by_hid, 'by_name' => $by_name, 'asked' => true, 'error' => ''];
++    $kept[$key] = [time(), $result];
++    return $result;
++}
++
++/** A computer's record in one kind of statistics - by its HID, or failing that by a name only it has. null when there isn't one. */
++function rmmMsp360Stat(array $stats, array $computer, array $name_counts): ?array
++{
++    $row = $stats['by_hid'][strtolower($computer['hid'])] ?? null;
++    if ($row === null && !$stats['by_hid'] && $computer['name'] !== '' && ($name_counts[mb_strtolower($computer['name'])] ?? 0) === 1) {
++        $row = $stats['by_name'][mb_strtolower($computer['name'])] ?? null;
++    }
++    return is_array($row) ? $row : null;
++}
++
++/*
++ * ------------------------------------------------------------------ Companies and computers
++ */
++
++/**
++ * The computers ITFlow brings in - the ones with the RMM agent - by company:
++ * ['ok', 'by_company' => [company id => [computer]], 'error', 'about']. One with no company is
++ * under '_none'. When the Managed Backup API doesn't say which agents a computer has, the ones
++ * the RMM API knows are taken as having it.
++ */
++function rmmMsp360Managed(array $provider): array
++{
++    $listed = rmmMsp360Computers($provider);
++    if (!$listed['ok']) {
++        return ['ok' => false, 'by_company' => [], 'error' => $listed['error'], 'about' => ''];
++    }
++    $host = rmmMsp360Stats($provider, 'host');
++    $about = !$host['asked'] && $host['ok'] ? 'No RMM API token is set, so computers come in without hardware details.'
++        : (!$host['ok'] ? 'The RMM API didn\'t answer (' . $host['error'] . '), so hardware details are left as they were.'
++        : ($host['by_hid'] ? 'Hardware details come from the RMM API.' : 'The RMM API doesn\'t say each computer\'s HID, so hardware details are matched by computer name.'));
++    // The agents weren't said - with the RMM API to ask, the computers it knows have its agent; without it, every one is taken to
++    $by_rmm_api = !$listed['agents_said'] && $host['asked'];
++    if ($by_rmm_api && (!$host['ok'] || !$host['by_hid'])) {
++        // Guessing here would bring in computers that only have the backup agent, as managed devices
++        return ['ok' => false, 'by_company' => [], 'error' => rmmProviderName($provider) . ' doesn\'t say which computers have the RMM agent, and the RMM API ' . (!$host['ok'] ? 'didn\'t answer (' . $host['error'] . ')' : 'doesn\'t say each computer\'s HID') . ' - nothing was changed', 'about' => ''];
++    }
++    if (!$listed['agents_said'] && !$host['asked']) {
++        $about = 'MSP360 doesn\'t say which computers have the RMM agent and no RMM API token is set, so every computer comes in, without hardware details.';
++    }
++    $by_company = [];
++    foreach ($listed['computers'] as $computer) {
++        $has = $computer['rmm'];
++        if ($has === null) {
++            $has = $by_rmm_api ? isset($host['by_hid'][strtolower($computer['hid'])]) : true;
++        }
++        if ($has) {
++            $by_company[$computer['company_id'] !== '' ? $computer['company_id'] : '_none'][] = $computer;
++        }
++    }
++    return ['ok' => true, 'by_company' => $by_company, 'error' => '', 'about' => $about];
++}
++
++/** MSP360's companies - ['ok', 'clients' => [id, name, sites, devices], 'error', 'about']. */
++function rmmMsp360Clients(array $provider): array
++{
++    $answer = rmmMsp360Backup($provider, 'api/Companies');
++    if (!$answer['ok']) {
++        return ['ok' => false, 'clients' => [], 'error' => $answer['error']];
++    }
++    $rows = rmmMsp360Rows($answer['json'], 'companies', 'items', 'data', 'result');
++    if ($rows === null) {
++        return ['ok' => false, 'clients' => [], 'error' => rmmProviderName($provider) . ' answered, but not with a list of its companies - nothing was changed'];
++    }
++    $managed = rmmMsp360Managed($provider);
++    if (!$managed['ok']) {
++        return ['ok' => false, 'clients' => [], 'error' => $managed['error']];
++    }
++    $clients = [];
++    foreach ($rows as $company) {
++        $id = (string) (rmmMsp360Value($company, 'id') ?? '');
++        if (!preg_match('/^[A-Za-z0-9_.:-]{1,100}$/', $id)) {
++            continue;
++        }
++        $name = rmmText(rmmMsp360Value($company, 'name') ?? '', 200);
++        $clients[] = ['id' => $id, 'name' => $name !== '' ? $name : "Company $id", 'sites' => 0, 'devices' => count($managed['by_company'][$id] ?? [])];
++    }
++    // Computers that are in no company have somewhere to be linked from too
++    if (!empty($managed['by_company']['_none'])) {
++        $clients[] = ['id' => '_none', 'name' => 'No company', 'sites' => 0, 'devices' => count($managed['by_company']['_none'])];
++    }
++    return ['ok' => true, 'clients' => $clients, 'error' => '', 'about' => $managed['about']];
++}
++
++/** An MSP360 company's computers - ['ok', 'devices', 'error'], each device as rmmDeviceSave() takes it. */
++function rmmMsp360Devices(array $provider, string $client_remote_id): array
++{
++    $managed = rmmMsp360Managed($provider);
++    if (!$managed['ok']) {
++        return ['ok' => false, 'devices' => [], 'error' => $managed['error']];
++    }
++    $host = rmmMsp360Stats($provider, 'host');
++    $summary = rmmMsp360Stats($provider, 'summary');
++    // A computer's name counts for matching only when one computer of the account has it
++    $name_counts = [];
++    foreach ($managed['by_company'] as $computers) {
++        foreach ($computers as $computer) {
++            $name_counts[mb_strtolower($computer['name'])] = ($name_counts[mb_strtolower($computer['name'])] ?? 0) + 1;
++        }
++    }
++    $devices = [];
++    foreach ($managed['by_company'][$client_remote_id] ?? [] as $computer) {
++        $devices[] = rmmMsp360Device($computer, $host['ok'] ? rmmMsp360Stat($host, $computer, $name_counts) : null, $summary['ok'] ? rmmMsp360Stat($summary, $computer, $name_counts) : null);
++    }
++    return ['ok' => true, 'devices' => $devices, 'error' => ''];
++}
++
++/** One of MSP360's computers as a device - $host and $summary are its records in the RMM API, when it has them. */
++function rmmMsp360Device(array $computer, ?array $host, ?array $summary): array
++{
++    $text = function ($key, $max = 255) use ($host) {
++        $value = rmmText(rmmMsp360Value($host, $key) ?? '', $max);
++        return rmmIsPlaceholder($value) ? '' : $value;
++    };
++    $network = rmmMsp360Value($host, 'network');
++    $os = $text('osName', 200);
++    $family = $computer['os'] === 'windows' || stripos($os, 'windows') !== false ? 'windows'
++        : ($computer['os'] === 'apple' || stripos($os, 'mac') !== false ? 'darwin' : ($computer['os'] === 'linux' ? 'linux' : ''));
++    $mac = rmmMac(rmmMsp360Value($network, 'macAddress') ?? '');
++    if ($mac === '') {
++        foreach ((array) (rmmMsp360Value($host, 'wakeOnLanInfos') ?? []) as $card) {
++            if (rmmMac(rmmMsp360Value($card, 'macAddress') ?? '') !== '') {
++                $mac = rmmMac(rmmMsp360Value($card, 'macAddress'));
++                break;
++            }
++        }
++    }
++    $local_ip = rmmText(rmmMsp360Value($network, 'ip4Address') ?? '', 100);
++    $user = $computer['user'] !== '' ? $computer['user'] : $text('lastLogin');
++    if ($user === '' && $text('userName') !== '') {
++        $user = ($text('userDomainName') !== '' ? $text('userDomainName') . '\\' : '') . $text('userName');
++    }
++    $cpu = trim(str_replace(['(R)', '(TM)', '(tm)', '(r)'], '', $text('cpuName', 300)));
++    $cores = intval(rmmMsp360Value($host, 'coresCount') ?? 0);
++    $threads = intval(rmmMsp360Value($host, 'logicalProcessorsCount') ?? 0);
++    $updates = rmmMsp360Value($host, 'updatesInfo');
++    // A time it was never told reads as year 1
++    $boot = (string) (rmmMsp360Value($host, 'lastBoot') ?? '');
++    $state = strtolower((string) (rmmMsp360Value($summary, 'computerState') ?? ''));
++    $status = $computer['online'] === true ? 'online' : ($computer['online'] === false ? 'offline' : (str_contains($state, 'offline') ? 'offline' : (str_contains($state, 'online') ? 'online' : '')));
++    $name = $computer['name'] !== '' ? $computer['name'] : $text('computerName', 200);
++    return [
++        'remote_id' => $computer['hid'],
++        'mac' => $mac,
++        'hostname' => $name,
++        'site' => '',
++        'role' => stripos($os, 'server') !== false || stripos($text('productType', 50), 'server') !== false ? 'server' : 'workstation',
++        'platform' => $family,
++        'os' => $os,
++        'status' => $status,
++        'last_seen_at' => rmmTime($computer['seen']),
++        'boot_at' => $boot !== '' && intval(substr($boot, 0, 4)) > 1990 ? rmmTime($boot) : null,
++        'logged_user' => $user,
++        'public_ip' => $computer['ip'],
++        'local_ips' => $local_ip,
++        'needs_reboot' => rmmMsp360Value($summary, 'pendingReboot') === true,
++        'patches_pending' => intval(rmmMsp360Value($updates, 'availableUpdatesCount') ?? 0) > 0,
++        'agent_version' => $computer['version'],
++        'asset' => [
++            'make' => $text('manufactured', 200) !== '' ? $text('manufactured', 200) : $text('manufacturer', 200),
++            'model' => $text('model', 200) !== '' ? $text('model', 200) : $text('computerSystemProduct', 200),
++            'serial' => (string) (is_scalar(rmmMsp360Value($host, 'serialNumber')) ? rmmMsp360Value($host, 'serialNumber') : ''),
++            'os' => $os,
++            'ip' => $local_ip,
++            'cpu' => mb_substr($cpu . ($cpu !== '' && $cores > 0 ? ", {$cores}C" . ($threads > 0 ? "/{$threads}T" : '') : ''), 0, 255),
++            'storage' => '',
++            'mac' => $mac,
++        ],
++    ];
++}
++
++/** Where Open in MSP360 goes - its console. */
++function rmmMsp360Dashboard(array $provider): string
++{
++    return rtrim(RMM_MSP360_CONSOLE, '/');
++}
+diff --git a/functions/rmm_omada.php b/functions/rmm_omada.php
+new file mode 100644
+index 000000000..1e1802638
+--- /dev/null
++++ b/functions/rmm_omada.php
+@@ -0,0 +1,463 @@
++<?php
++
++/*
++ * Omada - a network platform (Admin > Network Platforms), kinds of the RMM providers' engine
++ * (functions/rmm.php) in the network family, as UniFi's are (functions/rmm_unifi.php): a
++ * controller's sites are linked to clients, and its gateways, switches and access points become
++ * assets kept up to date, each known by its MAC address.
++ *
++ * It reads Omada's Open API - on the controller under Global View > Settings > Platform
++ * Integration > Open API. Hardware and software controllers have it from version 5.12; the
++ * Fusion gateways' built-in controller does not have it at all. Two ways in, one kind each:
++ *
++ *   omada      An application in Client mode: a client ID and secret, exchanged for an access
++ *              token that lasts two hours (POST /openapi/authorize/token?grant_type=
++ *              client_credentials, then Authorization: AccessToken=<token>). What it can see
++ *              is the role and the sites picked for the application.
++ *   omada_key  An API key, on a controller of version 6.4 or later, sent as it is
++ *              (Authorization: Bearer <key>). One made with View permission can change nothing.
++ *
++ * Both need two things the controller shows under View on the application or key: its
++ * Interface Access Address, and its Omada ID - which is in every path. The Omada ID is kept
++ * where another kind keeps its dashboard address (rmm_provider_web_url), as text.
++ *
++ * Answers are {errorCode, msg, result}, and a list's result is a page of it: {totalRows, data}.
++ * A site's id there is its siteId. Credentials made in MSP View use other paths
++ * (/openapi/v1/msp/...) and are not read here.
++ *
++ * Not here yet: tickets for devices that go offline (the 'alerts' functions), and firmware
++ * updates waiting, which the device list doesn't say.
++ */
++
++// What an Omada device's make is written as on its asset
++defined('RMM_OMADA_MAKE') || define('RMM_OMADA_MAKE', 'Omada');
++
++/** The Omada kinds - one for each way in. */
++function rmmOmadaKinds(): array
++{
++    return [
++        'omada' => rmmOmadaKind('omada'),
++        'omada_key' => rmmOmadaKind('omada_key'),
++    ];
++}
++
++/** One Omada kind, as rmmProviderKinds() describes a kind. */
++function rmmOmadaKind(string $key): array
++{
++    $kind = [
++        'family' => 'network',
++        'short' => 'Omada',
++        'icon' => 'fas fa-wifi',
++        'seal' => true,
++        'device_kinds' => ['Firewall/Router' => 'Gateways', 'Switch' => 'Switches', 'Access Point' => 'Access points', 'Other' => 'Other Omada devices'],
++        'links' => ['open' => 'Open in Omada'],
++        'clients' => 'rmmOmadaSites',
++        'devices' => 'rmmOmadaDevices',
++        'networks' => 'rmmOmadaNetworks',
++        'seen' => 'rmmOmadaSeen',
++        'dashboard' => 'rmmOmadaDashboard',
++        'docs_url' => 'https://support.omadanetworks.com/us/document/139218/',
++    ];
++    $fields = [
++        'api_url' => [
++            'label' => 'Interface access address', 'icon' => 'fa-server', 'type' => 'url', 'required' => true, 'placeholder' => 'https://192.168.0.2:8043',
++            'help' => 'Shown under View on the application or key in Omada, at Settings > Platform Integration > Open API. ITFlow needs to be able to reach it.',
++            'needed' => 'The controller\'s interface access address is needed - it is under View on the application or key in Omada.',
++        ],
++        'web_url' => [
++            'label' => 'Omada ID', 'icon' => 'fa-fingerprint', 'type' => 'text', 'required' => true, 'placeholder' => '',
++            'help' => 'The controller\'s Omada ID, shown beside the interface access address.',
++            'needed' => 'The Omada ID is needed - it is under View on the application or key in Omada.',
++        ],
++    ];
++    $insecure = [
++        'label' => 'Accept the certificate it made for itself', 'icon' => 'fa-certificate', 'type' => 'switch', 'required' => false, 'placeholder' => '',
++        'help' => 'A controller you run yourself makes its own certificate, which nothing trusts - turn this on for one reached by its own address. Leave it off for an address with a real certificate.',
++        'needed' => '', 'on' => 'its own certificate accepted', 'off' => 'its certificate checked',
++    ];
++    $hints = [
++        'not_found' => 'is that the interface access address Omada shows, and is its Open API on?',
++        'not_json' => 'is that the interface access address Omada shows under View?',
++        'certificate' => ' - a controller with a certificate it made for itself needs "Accept the certificate it made for itself" on.',
++    ];
++    if ($key === 'omada_key') {
++        return array_merge($kind, [
++            'name' => 'Omada controller (API key)',
++            'default_name' => 'Omada Controller',
++            'about' => 'An Omada controller of version 6.4 or later, with an API key - its sites, and their gateways, switches and access points as assets.',
++            'fields' => $fields + [
++                'api_secret' => [
++                    'label' => 'API key', 'icon' => 'fa-key', 'type' => 'secret', 'required' => true, 'placeholder' => '',
++                    'help' => 'In Omada: Settings > Platform Integration > Open API > Add New Credential, as an API key with View permission. Kept encrypted with this ITFlow\'s own key.',
++                    'needed' => 'The API key is needed - make one in Omada under Settings > Platform Integration > Open API.',
++                ],
++                'insecure' => $insecure,
++            ],
++            'hints' => $hints + ['auth' => 'check the key, made in Omada under Settings > Platform Integration > Open API, and the sites it may see.'],
++        ]);
++    }
++    return array_merge($kind, [
++        'name' => 'Omada controller (client ID)',
++        'default_name' => 'Omada Controller',
++        'about' => 'An Omada controller, with an Open API application in Client mode - its sites, and their gateways, switches and access points as assets.',
++        'fields' => $fields + [
++            'api_key' => [
++                'label' => 'Client ID', 'icon' => 'fa-id-badge', 'type' => 'text', 'required' => true, 'placeholder' => '',
++                'help' => 'In Omada: Settings > Platform Integration > Open API > Add New App, in Client mode, with a role that can only view.',
++                'needed' => 'The client ID is needed - make an application in Client mode in Omada under Settings > Platform Integration > Open API.',
++            ],
++            'api_secret' => [
++                'label' => 'Client secret', 'icon' => 'fa-key', 'type' => 'secret', 'required' => true, 'placeholder' => '',
++                'help' => 'Shown beside the client ID. Kept encrypted with this ITFlow\'s own key.',
++                'needed' => 'The client secret is needed - it is beside the client ID in Omada.',
++            ],
++            'insecure' => $insecure,
++        ],
++        'hints' => $hints + ['auth' => 'check the client ID and secret, and the role and sites picked for the application.'],
++    ]);
++}
++
++/*
++ * ------------------------------------------------------------------ Asking Omada
++ */
++
++/** The options every request of a controller takes - its own certificate accepted, when it says so. */
++function rmmOmadaOpts(array $provider): array
++{
++    return ['insecure' => intval($provider['rmm_provider_insecure'] ?? 0) === 1];
++}
++
++/** A controller's Omada ID as it goes into a path - '' when it isn't one. */
++function rmmOmadaId(array $provider): string
++{
++    $id = trim((string) ($provider['rmm_provider_web_url'] ?? ''));
++    return preg_match('/^[A-Za-z0-9_-]{1,100}$/', $id) ? $id : '';
++}
++
++/**
++ * What a request is signed with - ['ok', 'header', 'error']: the API key as it is (omada_key),
++ * or an access token got with the client ID and secret (omada). A token is kept for the
++ * request; $again gets a new one, for one that was turned away.
++ */
++function rmmOmadaAuth(array $provider, bool $again = false): array
++{
++    static $tokens = [];
++    $name = rmmProviderName($provider);
++    $base = rmmUrlClean($provider['rmm_provider_api_url'] ?? '');
++    $omada_id = rmmOmadaId($provider);
++    $secret = rmmSecret($provider, 'api_secret');
++    $unread = $secret === '' && (string) ($provider['rmm_provider_api_secret'] ?? '') !== '' ? ' - its secret can\'t be read, so type it again' : '';
++    if ($base === '' || $omada_id === '' || $secret === '') {
++        return ['ok' => false, 'header' => '', 'error' => "Its address, Omada ID and key aren't set$unread."];
++    }
++    if ((string) ($provider['rmm_provider_kind'] ?? '') === 'omada_key') {
++        return ['ok' => true, 'header' => 'Authorization: Bearer ' . $secret, 'error' => ''];
++    }
++
++    $id = intval($provider['rmm_provider_id'] ?? 0);
++    if (!$again && isset($tokens[$id])) {
++        return $tokens[$id];
++    }
++    $client_id = trim((string) ($provider['rmm_provider_api_key'] ?? ''));
++    if ($client_id === '') {
++        return ['ok' => false, 'header' => '', 'error' => 'Its client ID isn\'t set.'];
++    }
++    $answer = rmmHttp($provider, 'POST', "$base/openapi/authorize/token?grant_type=client_credentials", [],
++        ['omadacId' => $omada_id, 'client_id' => $client_id, 'client_secret' => $secret], 30, rmmOmadaOpts($provider));
++    if (!$answer['ok']) {
++        return $tokens[$id] = ['ok' => false, 'header' => '', 'error' => $answer['error']];
++    }
++    $token = is_array($answer['json']['result'] ?? null) ? (string) ($answer['json']['result']['accessToken'] ?? '') : '';
++    if (intval($answer['json']['errorCode'] ?? -1) !== 0 || $token === '' || preg_match('/[\x00-\x20]/', $token)) {
++        $said = rmmText($answer['json']['msg'] ?? '', 200);
++        return $tokens[$id] = ['ok' => false, 'header' => '', 'error' => "$name turned the client ID and secret away" . ($said !== '' ? " ($said)" : '') . ' - check them, the Omada ID, and that the application is in Client mode.'];
++    }
++    return $tokens[$id] = ['ok' => true, 'header' => 'Authorization: AccessToken=' . $token, 'error' => ''];
++}
++
++/**
++ * Ask the Open API for one thing - GET /openapi/<version>/<Omada ID>/<path>: ['ok', 'result',
++ * 'error', 'code']. An access token that was turned away is got again, once.
++ */
++function rmmOmadaAsk(array $provider, string $path, array $query = [], string $version = 'v1', int $timeout = 60): array
++{
++    $base = rmmUrlClean($provider['rmm_provider_api_url'] ?? '');
++    $url = "$base/openapi/$version/" . rawurlencode(rmmOmadaId($provider)) . '/' . ltrim($path, '/') . ($query ? '?' . http_build_query($query, '', '&') : '');
++    $auth = rmmOmadaAuth($provider);
++    for ($try = 0; $try < 2; $try++) {
++        if (!$auth['ok']) {
++            return ['ok' => false, 'result' => null, 'error' => $auth['error'], 'code' => 0];
++        }
++        $answer = rmmHttp($provider, 'GET', $url, [$auth['header']], null, $timeout, rmmOmadaOpts($provider));
++        // -44112 and -44113: the access token expired, or isn't one
++        $code = is_array($answer['json']) ? intval($answer['json']['errorCode'] ?? 0) : 0;
++        if ($try === 0 && ($answer['code'] === 401 || in_array($code, [-44112, -44113], true)) && (string) ($provider['rmm_provider_kind'] ?? '') !== 'omada_key') {
++            $auth = rmmOmadaAuth($provider, true);
++            continue;
++        }
++        break;
++    }
++    if (!$answer['ok']) {
++        return ['ok' => false, 'result' => null, 'error' => $answer['error'], 'code' => $answer['code']];
++    }
++    if (!array_key_exists('errorCode', $answer['json']) || intval($answer['json']['errorCode']) !== 0) {
++        $said = rmmText($answer['json']['msg'] ?? '', 200);
++        return ['ok' => false, 'result' => null, 'error' => rmmProviderName($provider) . ' answered, but not with what was asked for' . ($said !== '' ? " ($said)" : '') . ' - nothing was changed', 'code' => $answer['code']];
++    }
++    return ['ok' => true, 'result' => $answer['json']['result'] ?? null, 'error' => '', 'code' => $answer['code']];
++}
++
++/**
++ * Ask the Open API for a list, page by page - ['ok', 'data', 'total', 'error', 'code']. A page
++ * that isn't a list is an error, never "it has none": read as none, every device would be
++ * marked gone. $only_count asks for one entry, for how many there are.
++ */
++function rmmOmadaList(array $provider, string $path, string $version = 'v1', bool $only_count = false): array
++{
++    $data = [];
++    $size = $only_count ? 1 : 200;
++    for ($page = 1; $page <= 50; $page++) {
++        $answer = rmmOmadaAsk($provider, $path, ['page' => $page, 'pageSize' => $size], $version);
++        if (!$answer['ok']) {
++            return ['ok' => false, 'data' => [], 'total' => 0, 'error' => $answer['error'], 'code' => $answer['code']];
++        }
++        $rows = is_array($answer['result']) ? ($answer['result']['data'] ?? null) : null;
++        if (!rmmIsList($rows)) {
++            return ['ok' => false, 'data' => [], 'total' => 0, 'error' => rmmProviderName($provider) . ' answered, but not with a list - nothing was changed', 'code' => $answer['code']];
++        }
++        $total = intval($answer['result']['totalRows'] ?? count($rows));
++        $data = array_merge($data, $rows);
++        if ($only_count || !$rows || count($data) >= $total) {
++            return ['ok' => true, 'data' => $data, 'total' => $total, 'error' => '', 'code' => $answer['code']];
++        }
++    }
++    return ['ok' => false, 'data' => [], 'total' => 0, 'error' => rmmProviderName($provider) . ' has more than ITFlow reads in one go - nothing was changed', 'code' => 0];
++}
++
++/*
++ * ------------------------------------------------------------------ Sites, devices, networks
++ */
++
++/** A controller's sites - ['ok', 'clients' => [id, name, sites, devices], 'error', 'about'], as a kind's clients function gives them. */
++function rmmOmadaSites(array $provider): array
++{
++    $answer = rmmOmadaList($provider, 'sites');
++    if (!$answer['ok']) {
++        return ['ok' => false, 'clients' => [], 'error' => $answer['error']];
++    }
++    $sites = [];
++    foreach ($answer['data'] as $site) {
++        $id = is_array($site) ? (string) ($site['siteId'] ?? '') : '';
++        if (!preg_match('/^[A-Za-z0-9_-]{1,100}$/', $id)) {
++            continue;
++        }
++        $name = rmmText($site['name'] ?? '', 200);
++        $count = rmmOmadaList($provider, 'sites/' . rawurlencode($id) . '/devices', 'v1', true);
++        $sites[] = ['id' => $id, 'name' => $name !== '' ? $name : "Site $id", 'sites' => 1, 'devices' => $count['ok'] ? $count['total'] : 0];
++    }
++    // A controller with the one site it was given, never renamed, goes by the platform's name
++    if (count($sites) === 1 && strtolower($sites[0]['name']) === 'default') {
++        $sites[0]['name'] = rmmText($provider['rmm_provider_name'] ?? '', 200) ?: $sites[0]['name'];
++    }
++    return ['ok' => true, 'clients' => $sites, 'error' => '',
++        'about' => (string) ($provider['rmm_provider_kind'] ?? '') === 'omada_key' ? 'It reads Omada\'s Open API with an API key.' : 'It reads Omada\'s Open API as an application in Client mode.'];
++}
++
++/** A site's devices as Omada gave them, kept for the request - the sync asks for them, then for where things plug in. $set keeps them; null when not asked yet. */
++function rmmOmadaSiteDevices(array $provider, string $site, ?array $set = null): ?array
++{
++    static $kept = [];
++    $key = intval($provider['rmm_provider_id'] ?? 0) . '|' . $site;
++    if ($set !== null) {
++        $kept[$key] = $set;
++    }
++    return $kept[$key] ?? null;
++}
++
++/** One site's devices - ['ok', 'devices', 'error'], each as rmmDeviceSave() takes it. One waiting to be adopted isn't the site's yet. */
++function rmmOmadaDevices(array $provider, string $site): array
++{
++    $answer = rmmOmadaList($provider, 'sites/' . rawurlencode($site) . '/devices');
++    if (!$answer['ok']) {
++        return ['ok' => false, 'devices' => [], 'error' => $answer['error']];
++    }
++    rmmOmadaSiteDevices($provider, $site, $answer['data']);
++    $devices = [];
++    foreach ($answer['data'] as $device) {
++        if (is_array($device) && rmmMac($device['mac'] ?? '') !== '' && intval($device['status'] ?? -1) !== 2) {
++            $devices[] = rmmOmadaDevice($device);
++        }
++    }
++    return ['ok' => true, 'devices' => $devices, 'error' => ''];
++}
++
++/** The Open API's device (sites/{id}/devices) as a device. */
++function rmmOmadaDevice(array $device): array
++{
++    $mac = rmmMac($device['mac'] ?? '');
++    $type = strtolower((string) ($device['type'] ?? ''));
++    $model = rmmText($device['modelName'] ?? '', 200);
++    if ($model === '') {
++        $model = rmmText($device['model'] ?? '', 200);
++    }
++    $firmware = rmmText($device['firmwareVersion'] ?? '', 100);
++    // 1 connected is up; 0 disconnected, 3 heartbeat missed and 4 isolated are down. 2, pending, isn't brought in
++    $state = intval($device['status'] ?? -1);
++    $status = $state === 1 ? 'online' : (in_array($state, [0, 3, 4], true) ? 'offline' : '');
++    // Its last seen is in milliseconds
++    $seen = is_numeric($device['lastSeen'] ?? null) ? intdiv(intval($device['lastSeen']), intval($device['lastSeen']) > 99999999999 ? 1000 : 1) : 0;
++    $name = rmmText($device['name'] ?? '', 200);
++    $ip = rmmText($device['ip'] ?? '', 100);
++    return [
++        'remote_id' => $mac,
++        'mac' => $mac,
++        'hostname' => $name !== '' && rmmMac($name) === '' ? $name : trim($model . ' ' . strtoupper(substr($mac, -6))),
++        'site' => '',
++        'role' => '',
++        'platform' => 'omada',
++        'os' => $firmware,
++        'status' => $status,
++        'last_seen_at' => $seen > 0 ? rmmTime($seen) : null,
++        'public_ip' => $type === 'gateway' ? rmmText($device['publicIp'] ?? '', 100) : '',
++        'local_ips' => $ip,
++        'agent_version' => '',
++        'asset' => [
++            'type' => $type === 'gateway' ? 'Firewall/Router' : ($type === 'switch' ? 'Switch' : ($type === 'ap' ? 'Access Point' : 'Other')),
++            'make' => RMM_OMADA_MAKE,
++            'model' => $model,
++            'serial' => (string) ($device['sn'] ?? ''),
++            'os' => $firmware,
++            'ip' => $ip,
++            'mac' => $mac,
++        ],
++    ];
++}
++
++/**
++ * One site's networks and VLANs - ['ok', 'networks', 'error', 'unoffered'], each as rmmNetworkSave()
++ * takes it (functions/rmm_network.php). Only the ones with a subnet of their own - an interface,
++ * in Omada's word: a VLAN with no subnet isn't one of the client's networks. The second list
++ * (v2) says each DHCP range; a controller without it has the first (v1).
++ */
++function rmmOmadaNetworks(array $provider, string $site): array
++{
++    $answer = rmmOmadaList($provider, 'sites/' . rawurlencode($site) . '/lan-networks', 'v2');
++    if (!$answer['ok'] && in_array($answer['code'], [404, 405], true)) {
++        $answer = rmmOmadaList($provider, 'sites/' . rawurlencode($site) . '/lan-networks', 'v1');
++    }
++    if (!$answer['ok']) {
++        // A controller older than its networks list - nothing to bring in, and nothing wrong
++        return in_array($answer['code'], [404, 405], true) ? ['ok' => true, 'networks' => [], 'error' => '', 'unoffered' => true] : ['ok' => false, 'networks' => [], 'error' => $answer['error'], 'unoffered' => false];
++    }
++    $networks = [];
++    foreach ($answer['data'] as $net) {
++        $id = is_array($net) ? (string) ($net['id'] ?? '') : '';
++        $subnet = is_array($net) ? rmmOmadaSubnet($net['gatewaySubnet'] ?? '') : '';
++        if (!preg_match('/^[A-Za-z0-9_-]{1,100}$/', $id) || $subnet === '') {
++            continue;
++        }
++        $dhcp = is_array($net['dhcpSettingsVO'] ?? null) && !empty($net['dhcpSettingsVO']['enable']) ? $net['dhcpSettingsVO'] : [];
++        $range = is_array($dhcp['ipRangePool'][0] ?? null) ? $dhcp['ipRangePool'][0] : $dhcp;
++        $dns = [];
++        if ($dhcp && strtolower((string) ($dhcp['dhcpns'] ?? '')) === 'manual') {
++            foreach (['priDns', 'sndDns'] as $field) {
++                if (trim((string) ($dhcp[$field] ?? '')) !== '') {
++                    $dns[] = (string) $dhcp[$field];
++                }
++            }
++        }
++        $networks[] = [
++            'remote_id' => $id,
++            'name' => (string) ($net['name'] ?? ''),
++            'purpose' => 'lan',
++            // One VLAN (vlanType 0) is written down; several on one interface are not
++            'vlan' => intval($net['vlanType'] ?? 0) === 0 ? intval($net['vlan'] ?? 0) : 0,
++            'subnet' => $subnet,
++            'dhcp_start' => (string) ($range['ipaddrStart'] ?? ''),
++            'dhcp_stop' => (string) ($range['ipaddrEnd'] ?? ''),
++            'dns' => $dns,
++        ];
++    }
++    return ['ok' => true, 'networks' => $networks, 'error' => '', 'unoffered' => false];
++}
++
++/** Omada's gateway subnet - "192.168.0.1/24", or with its mask written out - as the gateway's address and prefix. '' when it isn't one. */
++function rmmOmadaSubnet($value): string
++{
++    [$host, $mask] = array_pad(explode('/', trim((string) $value), 2), 2, '');
++    if (!filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) || $mask === '') {
++        return '';
++    }
++    if (ctype_digit($mask)) {
++        return intval($mask) >= 1 && intval($mask) <= 32 ? "$host/" . intval($mask) : '';
++    }
++    $long = filter_var($mask, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ? ip2long($mask) : false;
++    if ($long === false) {
++        return '';
++    }
++    $bits = decbin($long & 0xFFFFFFFF);
++    return preg_match('/^1+0*$/', $bits) && strlen($bits) === 32 ? "$host/" . substr_count($bits, '1') : '';
++}
++
++/**
++ * What a site's switches and access points see - ['ok', 'seen', 'error'], each as rmmSeenSync()
++ * takes it (functions/rmm_network.php): what its own devices are plugged into, and the clients
++ * on it now - by switch and port, or access point and Wi-Fi network.
++ */
++function rmmOmadaSeen(array $provider, string $site): array
++{
++    $seen = [];
++    $devices = rmmOmadaSiteDevices($provider, $site);
++    if ($devices === null) {
++        $answer = rmmOmadaList($provider, 'sites/' . rawurlencode($site) . '/devices');
++        if (!$answer['ok']) {
++            return ['ok' => false, 'seen' => [], 'error' => $answer['error']];
++        }
++        $devices = $answer['data'];
++    }
++    foreach ($devices as $device) {
++        if (!is_array($device) || rmmMac($device['mac'] ?? '') === '' || rmmMac($device['uplinkDeviceMac'] ?? '') === '') {
++            continue;
++        }
++        $port = rmmText($device['uplinkDevicePort'] ?? '', 50);
++        $seen[] = [
++            'mac' => (string) $device['mac'], 'hostname' => (string) ($device['name'] ?? ''), 'ip' => (string) ($device['ip'] ?? ''),
++            'via_mac' => (string) $device['uplinkDeviceMac'], 'port' => $port, 'wired' => true, 'ssid' => '', 'network' => '', 'vlan' => 0,
++        ];
++    }
++
++    $answer = rmmOmadaList($provider, 'sites/' . rawurlencode($site) . '/clients');
++    if (!$answer['ok']) {
++        // A controller without its clients list - nothing to say, and nothing wrong
++        return in_array($answer['code'], [404, 405], true) ? ['ok' => true, 'seen' => $seen, 'error' => ''] : ['ok' => false, 'seen' => [], 'error' => $answer['error']];
++    }
++    foreach ($answer['data'] as $client) {
++        if (!is_array($client) || rmmMac($client['mac'] ?? '') === '' || ($client['active'] ?? true) === false) {
++            continue;
++        }
++        $wired = empty($client['wireless']);
++        $via = $wired ? (rmmMac($client['switchMac'] ?? '') !== '' ? $client['switchMac'] : ($client['gatewayMac'] ?? '')) : ($client['apMac'] ?? '');
++        $port = $wired && intval($client['port'] ?? 0) > 0 ? (string) intval($client['port']) : ($wired ? rmmText($client['portName'] ?? '', 50) : '');
++        $name = rmmText($client['name'] ?? '', 200);
++        $seen[] = [
++            'mac' => (string) $client['mac'],
++            // Omada names a client it knows nothing of by its MAC address - that isn't a name to match on
++            'hostname' => $name !== '' && rmmMac($name) === '' ? $name : (string) ($client['hostName'] ?? ''),
++            'ip' => (string) ($client['ip'] ?? ''),
++            'via_mac' => (string) $via, 'port' => $port, 'wired' => $wired, 'ssid' => $wired ? '' : (string) ($client['ssid'] ?? ''),
++            'network' => (string) ($client['networkName'] ?? ''), 'vlan' => intval($client['vid'] ?? 0),
++        ];
++    }
++    return ['ok' => true, 'seen' => $seen, 'error' => ''];
++}
++
++/** Where Open in Omada goes - the cloud portal for an address of Omada's cloud, or the controller's own. */
++function rmmOmadaDashboard(array $provider): string
++{
++    $base = rmmUrlClean($provider['rmm_provider_api_url'] ?? '');
++    $host = strtolower((string) parse_url($base, PHP_URL_HOST));
++    if ($host !== '' && (str_ends_with($host, '.tplinkcloud.com') || str_ends_with($host, '.omadanetworks.com'))) {
++        return 'https://omada.tplinkcloud.com';
++    }
++    return $base;
++}
